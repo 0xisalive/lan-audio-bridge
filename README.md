@@ -61,20 +61,44 @@ so no system libopus package is required. Audio I/O uses `cpal`:
   `pkg install alsa-lib pkgconf` (FreeBSD).
 - **macOS:** CoreAudio, part of the system SDK. No extra packages needed.
 
-Building the vendored libopus also needs a C toolchain and CMake.
+Building the vendored libopus also needs a C compiler and CMake. On FreeBSD this is not
+always present in the base system; see [Toolchain on FreeBSD](#toolchain-on-freebsd).
 
 ### Toolchain on FreeBSD
 
-FreeBSD ships Clang in the base system, so the only extra packages are the Rust
-toolchain, CMake, and `pkgconf` (plus `alsa-lib` for cpal). Install them with:
+The build needs a C compiler and linker (for the vendored libopus and the final Rust
+link step), CMake, `pkgconf`, and the Rust toolchain:
 
 ```sh
 pkg install rust cmake pkgconf alsa-lib
 ```
 
-That covers everything: `rust` provides `cargo`/`rustc`, `cmake` and base-system Clang
-build the vendored libopus, `pkgconf` lets cpal's build script locate ALSA, and
-`alsa-lib` is the audio backend. Then build as usual:
+**If the build fails with "no C compiler found", a linker error, or CMake cannot find a
+compiler, your install has no base-system Clang.** A normal FreeBSD RELEASE ships Clang
+as `/usr/bin/cc`, but minimal, jail, cloud, and CI images are often built without it.
+Check and, if missing, install LLVM from packages:
+
+```sh
+# Is a compiler present?
+cc --version || clang --version
+
+# If neither is found, install the LLVM toolchain (clang, lld, ar, ranlib).
+pkg install llvm
+```
+
+`pkg install llvm` provides versioned binaries such as `clang19`/`ld.lld19`. If `cc` is
+still not on `PATH` afterwards, point the build at the installed compiler explicitly so
+both the `cc` crate (libopus) and CMake use it:
+
+```sh
+export CC=clang
+export CXX=clang++
+export CMAKE_C_COMPILER=clang
+cargo build --release
+```
+
+Once a compiler, `cmake`, `pkgconf`, `alsa-lib`, and `rust` are all present, build as
+usual:
 
 ```sh
 cargo build --release
