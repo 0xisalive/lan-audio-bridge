@@ -1,10 +1,12 @@
 //! Host mode: capture system audio, encode it with Opus, and send it over UDP.
 //!
 //! cpal delivers captured samples on a real-time input callback that must never block
-//! or allocate. The callback therefore only copies interleaved samples into a lock-free
-//! SPSC ring buffer. A dedicated encoder thread drains the ring in exact 10 ms frames,
-//! encodes each frame with Opus, prepends the 16-byte wire header, and transmits it as
-//! a single UDP datagram.
+//! or allocate. The callback converts each sample to `f32` (the device's native format
+//! may be integer PCM, e.g. the ALSA-over-OSS stack on FreeBSD only offers integer
+//! formats) and copies the interleaved result into a lock-free SPSC ring buffer. A
+//! dedicated encoder thread drains the ring in exact 10 ms frames, encodes each frame
+//! with Opus, prepends the 16-byte wire header, and transmits it as a single UDP
+//! datagram.
 
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{Device, SampleFormat, SampleRate, StreamConfig};
+use cpal::{Device, FromSample, Sample, SampleFormat, SampleRate, SizedSample, StreamConfig};
 use opus::{Application, Bitrate, Channels, Encoder};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
@@ -48,18 +50,13 @@ pub fn run(target: &str, device_name: Option<&str>) -> Result<()> {
 
     let device = select_input_device(device_name)?;
     let dev_name = device.name().unwrap_or_else(|_| "<unknown>".into());
-    // Advisory only. Some backends (notably ALSA `plug`/`oss` PCMs on FreeBSD that
-    // front a virtual_oss loopback) under-report or omit their supported configs even
-    // though the stream opens fine with on-the-fly conversion. Treat a negative result
-    // as a warning and let `build_input_stream` be the authority on what actually works.
-    if !advertises_required_config(&device) {
-        tracing::warn!(
-            device = %dev_name,
-            "device does not advertise 48 kHz stereo f32 capture; attempting anyway \
-             (the backend may convert, e.g. an ALSA plug layer)"
-        );
-    }
-    tracing::info!(device = %dev_name, "capturing");
+
+    // Opus always encodes f32, but the capture device need not natively produce it.
+    // Pick a sample format the device actually supports and convert to f32 in the
+    // callback. This is what makes capture work on FreeBSD, where the ALSA-over-OSS
+    // stack (virtual_oss) only offers integer PCM formats, never float.
+    let sample_format = choose_capture_format(&device);
+    tracing::info!(device = %dev_name, format = ?sample_format, "capturing");
 
     let config = StreamConfig {
         channels: CHANNELS as u16,
@@ -69,7 +66,7 @@ pub fn run(target: &str, device_name: Option<&str>) -> Result<()> {
 
     // Lock-free hand-off: capture callback (producer) -> encoder loop (consumer).
     let ring = HeapRb::<f32>::new(FRAME_SAMPLES_INTERLEAVED * CAPTURE_RING_FRAMES);
-    let (mut producer, mut consumer) = ring.split();
+    let (producer, mut consumer) = ring.split();
 
     let running = Arc::new(AtomicBool::new(true));
     {
@@ -78,22 +75,7 @@ pub fn run(target: &str, device_name: Option<&str>) -> Result<()> {
             .context("installing Ctrl-C handler")?;
     }
 
-    let err_fn = |err| tracing::error!(error = %err, "capture stream error");
-    let stream = device
-        .build_input_stream(
-            &config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                // Push what fits. If the encoder thread has fallen behind, drop the
-                // overflow rather than block the real-time thread.
-                let pushed = producer.push_slice(data);
-                if pushed < data.len() {
-                    tracing::warn!(dropped = data.len() - pushed, "capture ring overflow");
-                }
-            },
-            err_fn,
-            None,
-        )
-        .context("building input stream")?;
+    let stream = build_capture_stream(&device, &config, sample_format, producer)?;
     stream.play().context("starting capture stream")?;
 
     let mut encoder = Encoder::new(SAMPLE_RATE, Channels::Stereo, Application::Audio)
@@ -160,21 +142,104 @@ fn select_input_device(device_name: Option<&str>) -> Result<Device> {
     }
 }
 
-/// Report whether the device *advertises* the required 48 kHz / stereo / f32 capture
-/// format. This is only a hint: a `false` result does not mean capture will fail, since
-/// a backend may convert formats transparently and may not enumerate every config it
-/// can satisfy. Any query error is treated as "unknown" (returns `false`).
-fn advertises_required_config(device: &Device) -> bool {
-    match device.supported_input_configs() {
-        Ok(mut configs) => configs.any(|c| {
-            c.channels() == CHANNELS as u16
-                && c.sample_format() == SampleFormat::F32
-                && c.min_sample_rate() <= SampleRate(SAMPLE_RATE)
-                && c.max_sample_rate() >= SampleRate(SAMPLE_RATE)
-        }),
+/// Choose the capture sample format. Prefer `f32` (no conversion), then fall back to
+/// the common integer formats, all of which convert losslessly-enough to `f32` for
+/// Opus. If the device enumerates no usable config (some ALSA plugin PCMs report an
+/// empty set), default to `i16`, the format FreeBSD's OSS stack almost always provides.
+fn choose_capture_format(device: &Device) -> SampleFormat {
+    // Preference order: native float first, then widest-to-narrowest integer.
+    const PREFERRED: [SampleFormat; 4] = [
+        SampleFormat::F32,
+        SampleFormat::I32,
+        SampleFormat::I16,
+        SampleFormat::U16,
+    ];
+
+    let advertised: Vec<SampleFormat> = match device.supported_input_configs() {
+        Ok(configs) => configs
+            .filter(|c| {
+                c.channels() == CHANNELS as u16
+                    && c.min_sample_rate() <= SampleRate(SAMPLE_RATE)
+                    && c.max_sample_rate() >= SampleRate(SAMPLE_RATE)
+            })
+            .map(|c| c.sample_format())
+            .collect(),
         Err(e) => {
             tracing::debug!(error = %e, "could not query supported input configs");
-            false
+            Vec::new()
+        }
+    };
+
+    for fmt in PREFERRED {
+        if advertised.contains(&fmt) {
+            return fmt;
         }
     }
+
+    // Nothing usable enumerated. i16 is the safest bet for OSS-backed capture.
+    tracing::debug!("no preferred capture format advertised; defaulting to i16");
+    SampleFormat::I16
+}
+
+/// Build the capture stream for the chosen sample format, converting every sample to
+/// `f32` before it enters the ring so the encoder loop only ever sees `f32`.
+fn build_capture_stream(
+    device: &Device,
+    config: &StreamConfig,
+    sample_format: SampleFormat,
+    producer: impl Producer<Item = f32> + Send + 'static,
+) -> Result<cpal::Stream> {
+    match sample_format {
+        SampleFormat::F32 => build_capture_stream_typed::<f32>(device, config, producer),
+        SampleFormat::I32 => build_capture_stream_typed::<i32>(device, config, producer),
+        SampleFormat::I16 => build_capture_stream_typed::<i16>(device, config, producer),
+        SampleFormat::U16 => build_capture_stream_typed::<u16>(device, config, producer),
+        other => Err(anyhow!("unsupported capture sample format {other:?}")),
+    }
+}
+
+/// Monomorphised capture-stream builder. `T` is the device's native sample type; each
+/// sample is converted to `f32` via cpal's `Sample` conversion before being pushed.
+fn build_capture_stream_typed<T>(
+    device: &Device,
+    config: &StreamConfig,
+    mut producer: impl Producer<Item = f32> + Send + 'static,
+) -> Result<cpal::Stream>
+where
+    T: SizedSample,
+    f32: FromSample<T>,
+{
+    // Reused scratch for the converted frame-sized chunk is not possible inside an
+    // `Fn` callback without interior mutability, so convert sample-by-sample straight
+    // into the ring; `push_slice` requires a slice, so stage into a small local buffer.
+    let err_fn = |err| tracing::error!(error = %err, "capture stream error");
+    let stream = device
+        .build_input_stream(
+            config,
+            move |data: &[T], _: &cpal::InputCallbackInfo| {
+                // Convert on the real-time thread (cheap: a multiply/clamp per sample)
+                // and push into the ring. A fixed stack buffer avoids allocation.
+                let mut scratch = [0.0f32; FRAME_SAMPLES_INTERLEAVED];
+                let mut written = 0usize;
+                let mut dropped = 0usize;
+                for &s in data {
+                    scratch[written] = f32::from_sample(s);
+                    written += 1;
+                    if written == scratch.len() {
+                        dropped += scratch.len() - producer.push_slice(&scratch);
+                        written = 0;
+                    }
+                }
+                if written > 0 {
+                    dropped += written - producer.push_slice(&scratch[..written]);
+                }
+                if dropped > 0 {
+                    tracing::warn!(dropped, "capture ring overflow");
+                }
+            },
+            err_fn,
+            None,
+        )
+        .context("building input stream")?;
+    Ok(stream)
 }
