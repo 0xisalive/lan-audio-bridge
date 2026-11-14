@@ -119,10 +119,15 @@ than do it by hand, run the provided script as root:
 sh scripts/freebsd-setup.sh
 ```
 
-It installs the required packages (`virtual_oss`, `alsa-lib`, `alsa-plugins`,
-`alsa-utils`), loads and persists `cuse`, starts a `virtual_oss` device that plays out
-to your speakers while mirroring to a capture monitor, writes `/usr/local/etc/asound.conf`
-to point ALSA's default capture at that monitor, and verifies capture works.
+It installs the ALSA packages it can (`alsa-lib`, `alsa-plugins`, `alsa-utils`), loads
+and persists `cuse`, starts a `virtual_oss` device that plays out to your speakers while
+mirroring to a capture monitor, writes `/usr/local/etc/asound.conf` to point ALSA's
+default capture at that monitor, and verifies capture works.
+
+`virtual_oss` itself is **not** installed by the script, since it is not reliably a
+`pkg` on every system. Install it first from ports (`audio/virtual_oss`) or your
+preferred source; the script checks that the `virtual_oss` binary is on `PATH` and stops
+with a clear message if it is missing.
 
 Then:
 

@@ -63,8 +63,12 @@ install_deps() {
 	log "checking packages (virtual_oss, alsa-lib, alsa-plugins, alsa-utils)"
 	# alsa-plugins provides the OSS plugin that lets ALSA (hence cpal) read an OSS node.
 	# alsa-utils provides arecord/aplay for the verification step.
+	#
+	# virtual_oss is intentionally NOT auto-installed: it is not reliably available as a
+	# pkg on every system (it may come from ports or a local build). We require the
+	# binary to be present and tell the user how to get it rather than guessing.
 	missing=""
-	for pkg in virtual_oss alsa-lib alsa-plugins alsa-utils; do
+	for pkg in alsa-lib alsa-plugins alsa-utils; do
 		if ! pkg info -e "$pkg" >/dev/null 2>&1; then
 			missing="$missing $pkg"
 		fi
@@ -74,7 +78,12 @@ install_deps() {
 		# shellcheck disable=SC2086
 		pkg install -y $missing || die "pkg install failed for:$missing"
 	else
-		log "all packages already present"
+		log "ALSA packages already present"
+	fi
+
+	if ! have virtual_oss; then
+		die "virtual_oss not found on PATH. Install it from ports (audio/virtual_oss) \
+or your preferred source, then re-run this script."
 	fi
 }
 
@@ -143,6 +152,25 @@ start_virtual_oss() {
 }
 
 # --- 4. ALSA configuration --------------------------------------------------------
+
+# libasound reads a per-user ~/.asoundrc that completely SHADOWS the system
+# /usr/local/etc/asound.conf. A stale ~/.asoundrc (e.g. one left from manual testing
+# that still points the default capture at an old device) silently overrides everything
+# the system config says. Detect it and move it aside so our system config takes effect.
+neutralise_user_asoundrc() {
+	user_rc="${HOME:-/root}/.asoundrc"
+	[ -f "$user_rc" ] || return 0
+
+	# If it already routes to our monitor, leave it; otherwise it would shadow us.
+	if grep -q "$LOOP_NAME" "$user_rc" 2>/dev/null; then
+		log "found ~/.asoundrc already referencing $LOOP_NAME; leaving it in place"
+		return 0
+	fi
+
+	bak="${user_rc}.bak.$(date +%Y%m%d%H%M%S)"
+	warn "a ~/.asoundrc exists and would override the system config; moving it to $bak"
+	mv "$user_rc" "$bak"
+}
 
 write_asound_conf() {
 	# ALSA format token for the bit depth (little-endian signed).
@@ -291,6 +319,7 @@ main() {
 	check_speaker_dsp
 	stop_stale_virtual_oss
 	start_virtual_oss
+	neutralise_user_asoundrc
 	write_asound_conf
 	verify_capture || true
 
