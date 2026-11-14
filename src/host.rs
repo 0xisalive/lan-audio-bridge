@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, SampleFormat, SampleRate, StreamConfig};
 use opus::{Application, Bitrate, Channels, Encoder};
@@ -48,8 +48,17 @@ pub fn run(target: &str, device_name: Option<&str>) -> Result<()> {
 
     let device = select_input_device(device_name)?;
     let dev_name = device.name().unwrap_or_else(|_| "<unknown>".into());
-    verify_input_config(&device)
-        .with_context(|| format!("device '{dev_name}' cannot run the required format"))?;
+    // Advisory only. Some backends (notably ALSA `plug`/`oss` PCMs on FreeBSD that
+    // front a virtual_oss loopback) under-report or omit their supported configs even
+    // though the stream opens fine with on-the-fly conversion. Treat a negative result
+    // as a warning and let `build_input_stream` be the authority on what actually works.
+    if !advertises_required_config(&device) {
+        tracing::warn!(
+            device = %dev_name,
+            "device does not advertise 48 kHz stereo f32 capture; attempting anyway \
+             (the backend may convert, e.g. an ALSA plug layer)"
+        );
+    }
     tracing::info!(device = %dev_name, "capturing");
 
     let config = StreamConfig {
@@ -151,19 +160,21 @@ fn select_input_device(device_name: Option<&str>) -> Result<Device> {
     }
 }
 
-/// Confirm the device can run the required 48 kHz / stereo / f32 capture format.
-fn verify_input_config(device: &Device) -> Result<()> {
-    let supported = device
-        .supported_input_configs()
-        .context("querying supported input configs")?
-        .any(|c| {
+/// Report whether the device *advertises* the required 48 kHz / stereo / f32 capture
+/// format. This is only a hint: a `false` result does not mean capture will fail, since
+/// a backend may convert formats transparently and may not enumerate every config it
+/// can satisfy. Any query error is treated as "unknown" (returns `false`).
+fn advertises_required_config(device: &Device) -> bool {
+    match device.supported_input_configs() {
+        Ok(mut configs) => configs.any(|c| {
             c.channels() == CHANNELS as u16
                 && c.sample_format() == SampleFormat::F32
                 && c.min_sample_rate() <= SampleRate(SAMPLE_RATE)
                 && c.max_sample_rate() >= SampleRate(SAMPLE_RATE)
-        });
-    if !supported {
-        bail!("device does not advertise 48 kHz stereo f32 capture");
+        }),
+        Err(e) => {
+            tracing::debug!(error = %e, "could not query supported input configs");
+            false
+        }
     }
-    Ok(())
 }
