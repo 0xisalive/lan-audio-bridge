@@ -1,0 +1,37 @@
+[package]
+name = "lan-audio-bridge"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+authors = ["lan-audio-bridge contributors"]
+description = "Low-latency LAN audio bridge: capture system audio on a host and stream it over UDP/Opus to a guest for real-time playback."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/0xisalive/lan-audio-bridge"
+readme = "README.md"
+keywords = ["audio", "opus", "udp", "low-latency", "streaming"]
+categories = ["multimedia::audio", "network-programming"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+# Portable Ctrl-C / SIGINT handling for a clean shutdown on all target platforms.
+ctrlc = "3.4"
+# cpal provides the cross-platform capture/playback backends (ALSA on Linux/FreeBSD,
+# CoreAudio on macOS).
+cpal = "0.15"
+# opus 0.4 pulls opusic-sys, which bundles and builds libopus from source by default.
+# This keeps the binary portable across FreeBSD, Linux and macOS without requiring a
+# system-wide libopus development package.
+opus = "0.4"
+# Lock-free SPSC ring buffer shared between the UDP receiver and the real-time audio
+# callback on the guest.
+ringbuf = "0.4"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+# Real-time audio favours predictable, aggressive optimisation.
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
