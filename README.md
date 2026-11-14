@@ -106,35 +106,43 @@ cargo build --release
 
 ## OS audio loopback setup (host)
 
-The host has physical speakers (`/dev/dsp0`); they are simply too quiet. To keep local
-playback working *and* capture a copy for the bridge, insert a `virtual_oss` device that
-plays out to the real hardware and exposes a loopback monitor the bridge reads from.
+The host has physical speakers; they are simply too quiet. The bridge needs to capture
+a copy of what is playing while audio keeps coming out of the real speakers.
 
-### FreeBSD (primary host)
+### FreeBSD (primary host) — use the setup script
 
-```sh
-pkg install virtual_oss
-
-# Create a 48 kHz stereo virtual DSP backed by the real speakers (/dev/dsp0), with a
-# loopback monitor the bridge captures from. Audio the browser sends to the virtual
-# device is played on the physical speakers and mirrored to vdsp.monitor.
-virtual_oss -C 2 -c 2 -r 48000 -b 16 -s 10ms \
-  -d dsp0 \
-  -c 2 -r 48000 -b 16 -s 10ms -w vdsp.monitor \
-  -t vdsp.ctl
-```
-
-`-d dsp0` makes the real speakers the playback backend, so you still hear audio locally
-(turn the virtual device's volume up with `mixer` or `virtual_oss_cmd` if the hardware
-is quiet). `-w vdsp.monitor` creates the capture device. Point applications (Chrome,
-Firefox) at the virtual device as their output, then point the bridge at the monitor:
+On FreeBSD this involves `cuse`, `virtual_oss`, and an ALSA-over-OSS config, with several
+sharp edges (device naming collisions, the ALSA/OSS bridge, format negotiation). Rather
+than do it by hand, run the provided script as root:
 
 ```sh
-./target/release/lan-audio-bridge host --target <GUEST_LAN_IP>:5555 --device vdsp.monitor
+sh scripts/freebsd-setup.sh
 ```
 
-To persist the `virtual_oss` device across reboots, add its flags to `/etc/rc.conf`
-(see `virtual_oss(8)` for the `virtual_oss_dsp` rc knobs).
+It installs the required packages (`virtual_oss`, `alsa-lib`, `alsa-plugins`,
+`alsa-utils`), loads and persists `cuse`, starts a `virtual_oss` device that plays out
+to your speakers while mirroring to a capture monitor, writes `/usr/local/etc/asound.conf`
+to point ALSA's default capture at that monitor, and verifies capture works.
+
+Then:
+
+1. Set your browser/application audio **output** to `/dev/vdsp` (you still hear it on
+   the real speakers; raise the level with `mixer` if it is quiet).
+2. Run the host with no `--device` (it uses the ALSA default, now the monitor):
+
+   ```sh
+   ./target/release/lan-audio-bridge host --target <GUEST_LAN_IP>:5555
+   ```
+
+The script is configurable through environment variables (see the comments at the top),
+e.g. `SPEAKER_DSP=/dev/dsp1 sh scripts/freebsd-setup.sh` if your hardware is not `dsp0`.
+Undo everything with `sh scripts/freebsd-teardown.sh`.
+
+Why no `--device <name>`: cpal on FreeBSD uses the ALSA backend, and ALSA device
+enumeration does not surface a raw `virtual_oss` node, so `--device` cannot find it by
+name. Routing the node through ALSA's `default` PCM (what the script does) is the
+reliable path, and the bridge captures in the device's native integer format and
+converts to `f32` internally.
 
 ### Linux (secondary host)
 
