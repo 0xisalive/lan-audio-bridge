@@ -38,8 +38,13 @@ CTL_NAME="${CTL_NAME:-vdsp.ctl}"
 RATE="${RATE:-48000}"
 CHANNELS="${CHANNELS:-2}"
 BITS="${BITS:-32}"
-# 10 ms buffer at RATE: samples = RATE / 100.
-BUFSAMPLES="${BUFSAMPLES:-480}"
+# virtual_oss buffer per channel, in samples. cpal's ALSA backend asks the OSS plugin
+# for a buffer of up to ~100 ms (via set_buffer_time_near); if virtual_oss's own buffer
+# is smaller, SNDCTL_DSP_SETFRAGMENTS fails and the stream will not open. Size the
+# virtual_oss buffer at ~120 ms (5760 samples at 48 kHz) so it comfortably satisfies
+# that request. This bounds the host-side buffering, not the end-to-end latency, which
+# the guest jitter buffer controls.
+BUFSAMPLES="${BUFSAMPLES:-5760}"
 
 ASOUND_CONF="${ASOUND_CONF:-/usr/local/etc/asound.conf}"
 
@@ -237,13 +242,12 @@ write_asound_conf() {
 
 	log "appending lan-audio-bridge capture override to $ASOUND_CONF (-> /dev/$LOOP_NAME)"
 
-	# A plug layer in front of the OSS node makes ALSA convert rate/channels/width to
-	# whatever cpal negotiates. The slave is left UNCONSTRAINED on purpose: pinning the
-	# slave's format/rate/channels makes ALSA refine the OSS node against exactly those
-	# params, and if the node does not report that precise combination the whole slave
-	# is rejected ("Slave PCM not usable"). An unconstrained plug slave lets the OSS
-	# node negotiate freely while plug adapts the client side. The OSS node only speaks
-	# integer PCM; float is handled inside the bridge, not here.
+	# The default is a PLAIN OSS pcm, no plug and no pinned period/buffer. This matches
+	# the one configuration we have confirmed `arecord -D default` opens successfully.
+	# Pinning period/buffer or wrapping in plug made ALSA push a fragment layout to
+	# virtual_oss via SNDCTL_DSP_SETFRAGMENTS that the node rejected. Letting ALSA
+	# negotiate fragments freely against the OSS node is what works. The bridge converts
+	# the device's native integer format to f32 itself, so plug conversion is not needed.
 	cat >> "$ASOUND_CONF" <<EOF
 
 $marker_begin
@@ -251,14 +255,9 @@ $marker_begin
 # virtual_oss monitor (/dev/$LOOP_NAME). Remove this block (and uncomment the lines
 # above) to restore the previous behaviour, or run scripts/freebsd-teardown.sh.
 
-pcm.lan_capture_oss {
+pcm.lan_capture {
     type oss
     device "/dev/$LOOP_NAME"
-}
-
-pcm.lan_capture {
-    type plug
-    slave.pcm "lan_capture_oss"
 }
 
 pcm.!default pcm.lan_capture
