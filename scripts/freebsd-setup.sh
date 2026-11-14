@@ -173,16 +173,36 @@ write_asound_conf() {
 			sed -i '' "/^${marker_begin}\$/,/^${marker_end}\$/d" "$ASOUND_CONF"
 		fi
 
-		# Comment out existing terse one-liner assignments for the nodes we override,
-		# so our block's definitions do not collide with theirs. This matches the stock
-		# file's `pcm.!default pcm.sysdefault` style lines. Block-brace definitions of
-		# these nodes are rare in the stock file; if present, the backup lets you adjust.
+		# Comment out every existing definition of the nodes we override, so our block
+		# does not collide with theirs. We must handle BOTH forms ALSA accepts:
+		#   terse one-liner:  pcm.!default pcm.sysdefault
+		#   block-brace form: pcm.!default { type oss device "/dev/dsp9" }
+		# The brace form can span multiple lines, so we track brace depth and comment
+		# out the whole definition, not just its opening line.
 		tmpf="$(mktemp -t lanbridge-conf)" || die "mktemp failed"
+		in_block=0
+		depth=0
 		while IFS= read -r line; do
+			if [ "$in_block" -eq 1 ]; then
+				# Inside a multi-line block we are neutralising: comment every line and
+				# track braces until the block closes.
+				printf '# (lan-audio-bridge: overridden below) %s\n' "$line" >> "$tmpf"
+				opens=$(printf '%s' "$line" | tr -cd '{' | wc -c | tr -d ' ')
+				closes=$(printf '%s' "$line" | tr -cd '}' | wc -c | tr -d ' ')
+				depth=$((depth + opens - closes))
+				[ "$depth" -le 0 ] && in_block=0
+				continue
+			fi
 			case "$line" in
 				pcm.!default[[:space:]]*|ctl.!default[[:space:]]*|\
 				pcm.!sysdefault[[:space:]]*|ctl.!sysdefault[[:space:]]*)
 					printf '# (lan-audio-bridge: overridden below) %s\n' "$line" >> "$tmpf"
+					# If this line opens a brace block that is not closed on the same
+					# line, keep commenting subsequent lines until braces balance.
+					opens=$(printf '%s' "$line" | tr -cd '{' | wc -c | tr -d ' ')
+					closes=$(printf '%s' "$line" | tr -cd '}' | wc -c | tr -d ' ')
+					depth=$((opens - closes))
+					[ "$depth" -gt 0 ] && in_block=1
 					;;
 				*)
 					printf '%s\n' "$line" >> "$tmpf"
