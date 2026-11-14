@@ -1,9 +1,10 @@
 # lan-audio-bridge
 
 A lightweight, low-latency (< 50 ms) client-server audio bridge written in Rust. It
-captures live browser/system audio on a headless **Host** machine (**FreeBSD** or
-**Linux**) and streams it over a local network (UDP/Opus) to a **Guest** machine
-(**macOS** or **Linux**) for real-time, lip-synced playback.
+captures live browser/system audio on a **Host** machine (**FreeBSD** or **Linux**) and
+streams it over a local network (UDP/Opus) to a **Guest** machine (**macOS** or
+**Linux**) for real-time, lip-synced playback. The host can keep playing audio on its
+own speakers while a copy is streamed to the guest.
 
 ## Architecture
 
@@ -60,35 +61,85 @@ so no system libopus package is required. Audio I/O uses `cpal`:
   `pkg install alsa-lib pkgconf` (FreeBSD).
 - **macOS:** CoreAudio, part of the system SDK. No extra packages needed.
 
-A C toolchain and CMake are required to build the vendored libopus.
+Building the vendored libopus also needs a C toolchain and CMake.
+
+### Toolchain on FreeBSD
+
+FreeBSD ships Clang in the base system, so the only extra packages are the Rust
+toolchain, CMake, and `pkgconf` (plus `alsa-lib` for cpal). Install them with:
+
+```sh
+pkg install rust cmake pkgconf alsa-lib
+```
+
+That covers everything: `rust` provides `cargo`/`rustc`, `cmake` and base-system Clang
+build the vendored libopus, `pkgconf` lets cpal's build script locate ALSA, and
+`alsa-lib` is the audio backend. Then build as usual:
+
+```sh
+cargo build --release
+```
 
 ## OS audio loopback setup (host)
 
-The host usually has no physical speakers, so create a dummy/loopback sink that the
-browser outputs to and that `lan-audio-bridge` captures from.
+The host has physical speakers (`/dev/dsp0`); they are simply too quiet. To keep local
+playback working *and* capture a copy for the bridge, insert a `virtual_oss` device that
+plays out to the real hardware and exposes a loopback monitor the bridge reads from.
 
 ### FreeBSD (primary host)
 
 ```sh
-pkg install virtual_oss opus rust
+pkg install virtual_oss
 
-# 48 kHz stereo virtual device (dsp0) backed by /dev/null, with a loopback monitor.
-virtual_oss -C 2 -c 2 -r 48000 -b 16 -s 10ms -f /dev/null -d dsp0 -w dsp0.monitor -t vdsp.ctl
+# Create a 48 kHz stereo virtual DSP backed by the real speakers (/dev/dsp0), with a
+# loopback monitor the bridge captures from. Audio the browser sends to the virtual
+# device is played on the physical speakers and mirrored to vdsp.monitor.
+virtual_oss -C 2 -c 2 -r 48000 -b 16 -s 10ms \
+  -d dsp0 \
+  -c 2 -r 48000 -b 16 -s 10ms -w vdsp.monitor \
+  -t vdsp.ctl
 ```
 
-Point the host at `dsp0.monitor` via `--device`.
+`-d dsp0` makes the real speakers the playback backend, so you still hear audio locally
+(turn the virtual device's volume up with `mixer` or `virtual_oss_cmd` if the hardware
+is quiet). `-w vdsp.monitor` creates the capture device. Point applications (Chrome,
+Firefox) at the virtual device as their output, then point the bridge at the monitor:
+
+```sh
+./target/release/lan-audio-bridge host --target <GUEST_LAN_IP>:5555 --device vdsp.monitor
+```
+
+To persist the `virtual_oss` device across reboots, add its flags to `/etc/rc.conf`
+(see `virtual_oss(8)` for the `virtual_oss_dsp` rc knobs).
 
 ### Linux (secondary host)
 
-```sh
-sudo apt install libopus-dev libasound2-dev pkg-config  # or use the vendored libopus
+To keep local playback and capture a copy, tee audio to both the real speakers and a
+null sink using a `module-combine-sink` (PulseAudio/PipeWire-pulse):
 
+```sh
+sudo apt install libasound2-dev pkg-config
+
+# A null sink whose .monitor the bridge captures from.
 pactl load-module module-null-sink sink_name=lan_out \
   sink_properties=device.description="LAN_Audio_Out"
-pactl set-default-sink lan_out
+
+# Fan out to the real speakers and the null sink, so you still hear audio locally.
+# Replace alsa_output... with your hardware sink from `pactl list short sinks`.
+pactl load-module module-combine-sink sink_name=lan_tee \
+  slaves=alsa_output.pci-0000_00_1f.3.analog-stereo,lan_out \
+  sink_properties=device.description="LAN_Tee"
+pactl set-default-sink lan_tee
 ```
 
-Point the host at `lan_out.monitor` via `--device`.
+Point the host at the null sink's monitor:
+
+```sh
+./target/release/lan-audio-bridge host --target <GUEST_LAN_IP>:5555 --device lan_out.monitor
+```
+
+If you do not need local playback, skip the combine sink and just set `lan_out` as the
+default; the bridge still reads `lan_out.monitor`.
 
 ### macOS (primary guest)
 
@@ -103,8 +154,8 @@ No capture setup is needed on the guest; it only plays back.
 # 2. Start the host (sender) on FreeBSD / Linux.
 ./target/release/lan-audio-bridge host --target <GUEST_LAN_IP>:5555
 
-# Optionally select a specific capture device.
-./target/release/lan-audio-bridge host --target <GUEST_LAN_IP>:5555 --device dsp0.monitor
+# Optionally select a specific capture device (the loopback monitor set up above).
+./target/release/lan-audio-bridge host --target <GUEST_LAN_IP>:5555 --device vdsp.monitor
 ```
 
 List available devices by starting the host with a bogus `--device` name; the error
