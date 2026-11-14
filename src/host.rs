@@ -19,7 +19,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Device, FromSample, Sample, SampleFormat, SampleRate, SizedSample, StreamConfig};
 use opus::{Application, Bitrate, Channels, Encoder};
 use ringbuf::traits::{Consumer, Observer, Producer, Split};
-use ringbuf::HeapRb;
+use ringbuf::{HeapCons, HeapRb};
 
 use crate::protocol::{
     Header, CHANNELS, FRAME_SAMPLES_INTERLEAVED, FRAME_SAMPLES_PER_CHANNEL, HEADER_LEN,
@@ -58,16 +58,6 @@ pub fn run(target: &str, device_name: Option<&str>) -> Result<()> {
     let sample_format = choose_capture_format(&device);
     tracing::info!(device = %dev_name, format = ?sample_format, "capturing");
 
-    let config = StreamConfig {
-        channels: CHANNELS as u16,
-        sample_rate: SampleRate(SAMPLE_RATE),
-        buffer_size: cpal::BufferSize::Fixed(FRAME_SAMPLES_PER_CHANNEL as u32),
-    };
-
-    // Lock-free hand-off: capture callback (producer) -> encoder loop (consumer).
-    let ring = HeapRb::<f32>::new(FRAME_SAMPLES_INTERLEAVED * CAPTURE_RING_FRAMES);
-    let (producer, mut consumer) = ring.split();
-
     let running = Arc::new(AtomicBool::new(true));
     {
         let running = running.clone();
@@ -75,7 +65,21 @@ pub fn run(target: &str, device_name: Option<&str>) -> Result<()> {
             .context("installing Ctrl-C handler")?;
     }
 
-    let stream = build_capture_stream(&device, &config, sample_format, producer)?;
+    // Prefer an exact 10 ms buffer for lowest latency, but some backends (notably the
+    // ALSA plug/oss path on FreeBSD) reject a fixed period size and fail hw_params.
+    // Fall back to the backend's default buffer so capture still works.
+    let (stream, mut consumer) = match build_capture_stream(
+        &device,
+        sample_format,
+        cpal::BufferSize::Fixed(FRAME_SAMPLES_PER_CHANNEL as u32),
+    ) {
+        Ok(ok) => ok,
+        Err(e) => {
+            tracing::warn!(error = %e, "fixed 10 ms buffer rejected; retrying with default buffer");
+            build_capture_stream(&device, sample_format, cpal::BufferSize::Default)
+                .context("building input stream with default buffer")?
+        }
+    };
     stream.play().context("starting capture stream")?;
 
     let mut encoder = Encoder::new(SAMPLE_RATE, Channels::Stereo, Application::Audio)
@@ -185,33 +189,39 @@ fn choose_capture_format(device: &Device) -> SampleFormat {
 /// `f32` before it enters the ring so the encoder loop only ever sees `f32`.
 fn build_capture_stream(
     device: &Device,
-    config: &StreamConfig,
     sample_format: SampleFormat,
-    producer: impl Producer<Item = f32> + Send + 'static,
-) -> Result<cpal::Stream> {
+    buffer_size: cpal::BufferSize,
+) -> Result<(cpal::Stream, HeapCons<f32>)> {
+    let config = StreamConfig {
+        channels: CHANNELS as u16,
+        sample_rate: SampleRate(SAMPLE_RATE),
+        buffer_size,
+    };
     match sample_format {
-        SampleFormat::F32 => build_capture_stream_typed::<f32>(device, config, producer),
-        SampleFormat::I32 => build_capture_stream_typed::<i32>(device, config, producer),
-        SampleFormat::I16 => build_capture_stream_typed::<i16>(device, config, producer),
-        SampleFormat::U16 => build_capture_stream_typed::<u16>(device, config, producer),
+        SampleFormat::F32 => build_capture_stream_typed::<f32>(device, &config),
+        SampleFormat::I32 => build_capture_stream_typed::<i32>(device, &config),
+        SampleFormat::I16 => build_capture_stream_typed::<i16>(device, &config),
+        SampleFormat::U16 => build_capture_stream_typed::<u16>(device, &config),
         other => Err(anyhow!("unsupported capture sample format {other:?}")),
     }
 }
 
 /// Monomorphised capture-stream builder. `T` is the device's native sample type; each
 /// sample is converted to `f32` via cpal's `Sample` conversion before being pushed.
+/// Owns the SPSC ring and returns the consumer alongside the stream so a failed build
+/// drops its own ring cleanly and the caller can retry with different parameters.
 fn build_capture_stream_typed<T>(
     device: &Device,
     config: &StreamConfig,
-    mut producer: impl Producer<Item = f32> + Send + 'static,
-) -> Result<cpal::Stream>
+) -> Result<(cpal::Stream, HeapCons<f32>)>
 where
     T: SizedSample,
     f32: FromSample<T>,
 {
-    // Reused scratch for the converted frame-sized chunk is not possible inside an
-    // `Fn` callback without interior mutability, so convert sample-by-sample straight
-    // into the ring; `push_slice` requires a slice, so stage into a small local buffer.
+    // Lock-free hand-off: capture callback (producer) -> encoder loop (consumer).
+    let ring = HeapRb::<f32>::new(FRAME_SAMPLES_INTERLEAVED * CAPTURE_RING_FRAMES);
+    let (mut producer, consumer) = ring.split();
+
     let err_fn = |err| tracing::error!(error = %err, "capture stream error");
     let stream = device
         .build_input_stream(
@@ -241,5 +251,5 @@ where
             None,
         )
         .context("building input stream")?;
-    Ok(stream)
+    Ok((stream, consumer))
 }

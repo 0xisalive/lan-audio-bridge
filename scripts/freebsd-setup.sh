@@ -173,14 +173,6 @@ neutralise_user_asoundrc() {
 }
 
 write_asound_conf() {
-	# ALSA format token for the bit depth (little-endian signed).
-	case "$BITS" in
-		16) alsa_fmt="S16_LE" ;;
-		24) alsa_fmt="S24_LE" ;;
-		32) alsa_fmt="S32_LE" ;;
-		*)  alsa_fmt="S16_LE" ;;
-	esac
-
 	mkdir -p "$(dirname "$ASOUND_CONF")"
 
 	# ALSA rejects a config that assigns the same node (e.g. pcm.!default) twice, so we
@@ -245,9 +237,13 @@ write_asound_conf() {
 
 	log "appending lan-audio-bridge capture override to $ASOUND_CONF (-> /dev/$LOOP_NAME)"
 
-	# A plug layer in front of the OSS node makes ALSA convert rate/channels/width as
-	# needed, so cpal gets a stable face regardless of what it negotiates. The OSS node
-	# itself only speaks integer PCM; float is handled inside the bridge, not here.
+	# A plug layer in front of the OSS node makes ALSA convert rate/channels/width to
+	# whatever cpal negotiates. The slave is left UNCONSTRAINED on purpose: pinning the
+	# slave's format/rate/channels makes ALSA refine the OSS node against exactly those
+	# params, and if the node does not report that precise combination the whole slave
+	# is rejected ("Slave PCM not usable"). An unconstrained plug slave lets the OSS
+	# node negotiate freely while plug adapts the client side. The OSS node only speaks
+	# integer PCM; float is handled inside the bridge, not here.
 	cat >> "$ASOUND_CONF" <<EOF
 
 $marker_begin
@@ -255,17 +251,14 @@ $marker_begin
 # virtual_oss monitor (/dev/$LOOP_NAME). Remove this block (and uncomment the lines
 # above) to restore the previous behaviour, or run scripts/freebsd-teardown.sh.
 
+pcm.lan_capture_oss {
+    type oss
+    device "/dev/$LOOP_NAME"
+}
+
 pcm.lan_capture {
     type plug
-    slave {
-        pcm {
-            type oss
-            device "/dev/$LOOP_NAME"
-        }
-        rate $RATE
-        channels $CHANNELS
-        format $alsa_fmt
-    }
+    slave.pcm "lan_capture_oss"
 }
 
 pcm.!default pcm.lan_capture
