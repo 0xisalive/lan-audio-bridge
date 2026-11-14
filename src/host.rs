@@ -40,23 +40,24 @@ const CAPTURE_RING_FRAMES: usize = 20;
 /// A fraction of a frame keeps latency low without busy-spinning a core.
 const ENCODER_IDLE_PARK: Duration = Duration::from_micros(500);
 
+/// A source of interleaved stereo `f32` PCM, one 10 ms frame at a time.
+///
+/// Implemented by both the cpal-ring capture path and the FreeBSD direct-OSS reader so
+/// the encode-and-send loop is written once. `fill` blocks (or parks) until a full
+/// frame is available and returns the number of interleaved samples written, which is
+/// [`FRAME_SAMPLES_INTERLEAVED`] in steady state and `0` only on shutdown or end of
+/// stream.
+pub(crate) trait PcmSource {
+    fn fill(&mut self, out: &mut [f32]) -> usize;
+}
+
 /// Run the host (sender) until Ctrl-C.
-pub fn run(target: &str, device_name: Option<&str>) -> Result<()> {
+pub fn run(target: &str, device_name: Option<&str>, oss_device: Option<&str>) -> Result<()> {
     let socket = UdpSocket::bind("0.0.0.0:0").context("binding host UDP socket")?;
     socket
         .connect(target)
         .with_context(|| format!("connecting UDP socket to {target}"))?;
     tracing::info!(%target, "streaming audio to guest");
-
-    let device = select_input_device(device_name)?;
-    let dev_name = device.name().unwrap_or_else(|_| "<unknown>".into());
-
-    // Opus always encodes f32, but the capture device need not natively produce it.
-    // Pick a sample format the device actually supports and convert to f32 in the
-    // callback. This is what makes capture work on FreeBSD, where the ALSA-over-OSS
-    // stack (virtual_oss) only offers integer PCM formats, never float.
-    let sample_format = choose_capture_format(&device);
-    tracing::info!(device = %dev_name, format = ?sample_format, "capturing");
 
     let running = Arc::new(AtomicBool::new(true));
     {
@@ -65,10 +66,36 @@ pub fn run(target: &str, device_name: Option<&str>) -> Result<()> {
             .context("installing Ctrl-C handler")?;
     }
 
-    // Prefer an exact 10 ms buffer for lowest latency, but some backends (notably the
-    // ALSA plug/oss path on FreeBSD) reject a fixed period size and fail hw_params.
-    // Fall back to the backend's default buffer so capture still works.
-    let (stream, mut consumer) = match build_capture_stream(
+    // Two capture paths. On FreeBSD, reading an OSS device (e.g. /dev/dsp0) directly
+    // avoids the cpal -> ALSA -> alsa-plugins-oss stack entirely, which is both simpler
+    // and sidesteps the OSS-plugin fragment negotiation that stack is prone to failing.
+    // Everywhere else (and when no --oss-device is given) we use cpal.
+    if let Some(path) = oss_device {
+        #[cfg(target_os = "freebsd")]
+        {
+            let mut source = crate::oss::OssCapture::open(path)
+                .with_context(|| format!("opening OSS device {path}"))?;
+            return run_sender(&socket, &mut source, &running);
+        }
+        #[cfg(not(target_os = "freebsd"))]
+        {
+            let _ = path;
+            anyhow::bail!("--oss-device is only supported on FreeBSD");
+        }
+    }
+
+    let device = select_input_device(device_name)?;
+    let dev_name = device.name().unwrap_or_else(|_| "<unknown>".into());
+
+    // Opus always encodes f32, but the capture device need not natively produce it.
+    // Pick a sample format the device actually supports and convert to f32 in the
+    // callback.
+    let sample_format = choose_capture_format(&device);
+    tracing::info!(device = %dev_name, format = ?sample_format, "capturing");
+
+    // Prefer an exact 10 ms buffer for lowest latency, but some backends reject a fixed
+    // period size and fail hw_params. Fall back to the backend's default buffer.
+    let (stream, consumer) = match build_capture_stream(
         &device,
         sample_format,
         cpal::BufferSize::Fixed(FRAME_SAMPLES_PER_CHANNEL as u32),
@@ -82,6 +109,23 @@ pub fn run(target: &str, device_name: Option<&str>) -> Result<()> {
     };
     stream.play().context("starting capture stream")?;
 
+    let mut source = RingSource {
+        consumer,
+        running: running.clone(),
+    };
+    let result = run_sender(&socket, &mut source, &running);
+    drop(stream);
+    result
+}
+
+/// The shared encode-and-send loop. Reads 10 ms frames from `source`, encodes each with
+/// Opus, prepends the wire header, and sends one datagram per frame until `running`
+/// clears or the source ends.
+fn run_sender(
+    socket: &UdpSocket,
+    source: &mut dyn PcmSource,
+    running: &AtomicBool,
+) -> Result<()> {
     let mut encoder = Encoder::new(SAMPLE_RATE, Channels::Stereo, Application::Audio)
         .map_err(|e| anyhow!("creating Opus encoder: {e}"))?;
     encoder
@@ -96,17 +140,12 @@ pub fn run(target: &str, device_name: Option<&str>) -> Result<()> {
     let mut packet = vec![0u8; MAX_DATAGRAM];
     let mut seq_num: u32 = 0;
 
-    // Encoder loop: drain the ring one whole 10 ms frame at a time, encode, and send.
-    // Popping only when a full frame is buffered keeps channel interleaving aligned;
-    // a short frame would desynchronise left/right from then on.
     while running.load(Ordering::Relaxed) {
-        if consumer.occupied_len() < FRAME_SAMPLES_INTERLEAVED {
-            thread::sleep(ENCODER_IDLE_PARK);
+        let got = source.fill(&mut frame);
+        if got < FRAME_SAMPLES_INTERLEAVED {
+            // Short read: shutdown or end of stream.
             continue;
         }
-
-        let got = consumer.pop_slice(&mut frame);
-        debug_assert_eq!(got, FRAME_SAMPLES_INTERLEAVED);
 
         let payload_len = encoder
             .encode_float(&frame, &mut packet[HEADER_LEN..])
@@ -127,8 +166,27 @@ pub fn run(target: &str, device_name: Option<&str>) -> Result<()> {
     }
 
     tracing::info!("host shutting down");
-    drop(stream);
     Ok(())
+}
+
+/// [`PcmSource`] backed by the lock-free ring the cpal callback fills. Parks briefly
+/// when the ring does not yet hold a whole frame rather than busy-spinning.
+struct RingSource {
+    consumer: HeapCons<f32>,
+    running: Arc<AtomicBool>,
+}
+
+impl PcmSource for RingSource {
+    fn fill(&mut self, out: &mut [f32]) -> usize {
+        // Pop only whole frames so left/right interleaving stays aligned.
+        while self.consumer.occupied_len() < FRAME_SAMPLES_INTERLEAVED {
+            if !self.running.load(Ordering::Relaxed) {
+                return 0;
+            }
+            thread::sleep(ENCODER_IDLE_PARK);
+        }
+        self.consumer.pop_slice(out)
+    }
 }
 
 /// Resolve the capture device: an explicit name if given, else the default input.

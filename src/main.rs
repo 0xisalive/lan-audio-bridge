@@ -7,6 +7,8 @@
 
 mod guest;
 mod host;
+#[cfg(target_os = "freebsd")]
+mod oss;
 mod protocol;
 
 use anyhow::Result;
@@ -31,6 +33,11 @@ enum Mode {
         /// Capture device name. Defaults to the system default input device.
         #[arg(long, value_name = "NAME")]
         device: Option<String>,
+
+        /// FreeBSD only: capture directly from this OSS device path (e.g.
+        /// /dev/dsp0), bypassing cpal/ALSA entirely. Takes precedence over --device.
+        #[arg(long, value_name = "PATH")]
+        oss_device: Option<String>,
     },
 
     /// Receive an audio stream and play it back.
@@ -50,7 +57,11 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.mode {
-        Mode::Host { target, device } => host::run(&target, device.as_deref()),
+        Mode::Host {
+            target,
+            device,
+            oss_device,
+        } => host::run(&target, device.as_deref(), oss_device.as_deref()),
         Mode::Guest { bind, buffer_ms } => guest::run(&bind, buffer_ms),
     }
 }

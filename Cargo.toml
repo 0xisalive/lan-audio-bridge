@@ -29,6 +29,11 @@ ringbuf = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Used by build.rs to compile the FreeBSD OSS ioctl shim (src/oss_shim.c). The compile
+# is gated on the target OS inside build.rs; on other platforms cc is pulled but unused.
+[build-dependencies]
+cc = "1.0"
+
 [profile.release]
 # Real-time audio favours predictable, aggressive optimisation.
 opt-level = 3

@@ -104,16 +104,35 @@ usual:
 cargo build --release
 ```
 
-## OS audio loopback setup (host)
+## Audio capture setup (host)
 
-The host has physical speakers; they are simply too quiet. The bridge needs to capture
-a copy of what is playing while audio keeps coming out of the real speakers.
+### FreeBSD (primary host) — direct OSS capture (recommended)
 
-### FreeBSD (primary host) — use the setup script
+If the audio you want is already present on an OSS device (for example `/dev/dsp0`, a
+line-in, a loopback, or a card that mixes playback into its record stream), capture it
+directly. This bypasses cpal, ALSA, and the ALSA OSS plugin entirely:
 
-On FreeBSD this involves `cuse`, `virtual_oss`, and an ALSA-over-OSS config, with several
-sharp edges (device naming collisions, the ALSA/OSS bridge, format negotiation). Rather
-than do it by hand, run the provided script as root:
+```sh
+./target/release/lan-audio-bridge host --target <GUEST_LAN_IP>:5555 --oss-device /dev/dsp0
+```
+
+`--oss-device` opens the device, negotiates 48 kHz stereo at the device's native format
+(S32 or S16), and converts to `f32` internally. No `virtual_oss`, no `cuse`, no
+`asound.conf`, no `alsa-plugins`. Confirm the device carries the audio you expect first:
+
+```sh
+cat /dev/sndstat                              # list devices (play/rec)
+dd if=/dev/dsp0 of=/tmp/raw.pcm bs=4096 count=140   # ~3 s; non-empty => capturable
+```
+
+### FreeBSD — capturing played-back audio with virtual_oss (fallback)
+
+Use this only if you need to capture what is being *played* (the speaker signal) and the
+hardware does not expose it as a record stream. It inserts a `virtual_oss` device that
+plays to the real speakers while mirroring to a capture monitor, then wires that monitor
+into ALSA. It involves `cuse`, `virtual_oss`, and an ALSA-over-OSS config, with device
+naming collisions and format/fragment negotiation to get right, so a script automates it.
+Run it as root:
 
 ```sh
 sh scripts/freebsd-setup.sh
